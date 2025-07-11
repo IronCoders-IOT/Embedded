@@ -1,137 +1,111 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
+#include <WiFi.h>           // Library to manage WiFi connection on ESP32
+#include <HTTPClient.h>     // Library to perform HTTP requests
 
-const char* ssid = "KISI WIFI-1";
-const char* password = "09724426";
-const char* serverName = "http://IPPC:5001/api/v1/water-monitoring/data-records";
+// Pin definitions for sensors and actuators
+#define TRIG_PIN 5          // Trigger pin for ultrasonic sensor
+#define ECHO_PIN 18         // Echo pin for ultrasonic sensor
+#define TDS_PIN 34          // Analog input pin for TDS sensor
+#define LED_ROJO_PIN 23     // Pin for the red indicator LED
 
-const int trigPin = 5;     // D5 for HC-SR04 TRIG
-const int echoPin = 18;    // D18 for HC-SR04 ECHO (use voltage divider)
-const int ledPin  = 2;     // Built-in LED of ESP32
-const int tdsPin = 34;     // Analog pin for TDS sensor (A0 or D34)
+// WiFi and server configuration
+const char* ssid = "iPhone de Rod Aguilar"; // WiFi network name
+const char* password = "123456789";         // WiFi password
+const char* serverName = "https://cuddly-islands-repeat.loca.lt/api/v1/water-monitoring/data-records"; // Server URL to send data
+const char* apiKey = "test";                // API key for authentication
 
-String lastQualityText = "";  // Variable to store the last quality sent
+// Variables to store last readings
+long lastRawDuration = -1;                  // Last measured duration from the ultrasonic sensor
+int lastRawTDS = -1;                        // Last TDS value read
+const long RAW_MOVEMENT_THRESHOLD = 14;     // Threshold to detect significant distance changes
+const int TDS_MOVEMENT_THRESHOLD = 10;      // Threshold to detect significant TDS changes
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("Analog read test on pin 34 (TDS)");
+  Serial.begin(115200);                     // Initialize serial communication
+  pinMode(TRIG_PIN, OUTPUT);                // Set TRIG pin as output
+  pinMode(ECHO_PIN, INPUT);                 // Set ECHO pin as input
+  pinMode(LED_ROJO_PIN, OUTPUT);            // Set LED pin as output
+  digitalWrite(LED_ROJO_PIN, LOW);          // Turn off LED at start
 
-  analogSetPinAttenuation(tdsPin, ADC_11db); 
+  WiFi.begin(ssid, password, 6);            // Try to connect to WiFi, channel 6
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {   // Wait until connection is established
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\n✅ WiFi connected!");
-  Serial.print("📡 Assigned IP: ");
-  Serial.println(WiFi.localIP());
-
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
-  pinMode(ledPin, OUTPUT);
-
-  Serial.println("🚀 Starting sensors...");
-}
-
-String getQualityText(float tds) {
-  if (tds <= 100) return "Excellent";
-  else if (tds <= 300) return "Good";
-  else if (tds <= 600) return "Fair";
-  else if (tds <= 900) return "Poor";
-  else if (tds <= 1200) return "Not drinkable";
-  else return "Contaminated water";
+  Serial.println("\nWiFi connected!");
 }
 
 void loop() {
-  int tdsValue = analogRead(tdsPin);
-  Serial.println("🔌 Analog value read on pin 34 (TDS): " + String(tdsValue));
+  long raw_duration = getRawDuration();     // Get the ultrasonic pulse duration
+  int raw_tds = analogRead(TDS_PIN);        // Read the analog value from the TDS sensor
 
-  // Distance sensor
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+  Serial.print("Raw duration (us): ");
+  Serial.println(raw_duration);
+  Serial.print("Raw TDS: ");
+  Serial.println(raw_tds);
 
-  long duration = pulseIn(echoPin, HIGH, 30000);
+  // Detect if there are significant changes in distance or TDS
+  bool distanceChanged = (lastRawDuration < 0 || abs(raw_duration - lastRawDuration) > RAW_MOVEMENT_THRESHOLD);
+  bool tdsChanged = (lastRawTDS < 0 || abs(raw_tds - lastRawTDS) > TDS_MOVEMENT_THRESHOLD);
 
-  float distance = 0.0;
-  if (duration == 0) {
-    Serial.println("❌ No signal detected from HC-SR04.");
-    digitalWrite(ledPin, LOW);
-  } else {
-    distance = duration * 0.034 / 2;
-    Serial.print("✅ Distance: ");
-    Serial.print(distance);
-    Serial.println(" cm");
-    digitalWrite(ledPin, (distance < 10) ? HIGH : LOW);
+  if (distanceChanged || tdsChanged) {
+    sendData(raw_tds, raw_duration);        // Send data to server if there are changes
+    lastRawDuration = raw_duration;         // Update last values
+    lastRawTDS = raw_tds;
   }
 
-  // TDS calculation
-  float voltage = tdsValue * (3.3 / 4095.0);
-  Serial.print("💧 Voltage: ");
-  Serial.print(voltage, 3);
-
-  float tds = (133.42 * voltage * voltage * voltage) 
-            - (255.86 * voltage * voltage) 
-            + (857.39 * voltage);
-
-  String qualityText = getQualityText(tds);
-  Serial.print(" | TDS: ");
-  Serial.print(tds, 2);
-  Serial.print(" ppm → Quality: ");
-  Serial.println(qualityText);
-
-  // Only send if quality has changed
-  if (qualityText != lastQualityText) {
-    if (WiFi.status() == WL_CONNECTED) {
-      sendDataToServer(distance, tds, qualityText);
-      lastQualityText = qualityText; // Update the last value sent
-    } else {
-      Serial.println("⚠️ WiFi not connected.");
-    }
-  } else {
-    Serial.println("Water quality unchanged, POST not sent.");
-  }
-
-  delay(5000);
+  delay(1000);                             // Wait 1 second before next reading
 }
 
-void sendDataToServer(float distance, float tds, String qualityText) {
-  HTTPClient http;
-  http.begin(serverName);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", "test-api-key-123");
+// Function to measure the ultrasonic pulse duration (distance)
+long getRawDuration() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
 
-  StaticJsonDocument<256> doc;
-  doc["device_id"] = "esp32-01"; 
-  doc["bpm"] = 0;
-  doc["eventType"] = "water-measurement";
-  doc["qualityValue"] = qualityText;
-  doc["levelValue"] = distance;
-  doc["sensorId"] = 1;
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // Wait up to 30 ms for the pulse
+  return duration;
+}
 
-  String requestBody;
-  serializeJson(doc, requestBody);
+// Function to send data to the server via HTTP POST
+void sendData(int raw_tds, long raw_distance) {
+  if (WiFi.status() == WL_CONNECTED) {     // Verify WiFi connection
+    HTTPClient http;
+    http.begin(serverName);                // Start connection to server
+    http.addHeader("Content-Type", "application/json"); // Specify content type
+    http.addHeader("X-API-Key", apiKey);  // Add API key header
 
-  Serial.println("📤 Sending data: " + requestBody);
+    // Build JSON with data to send
+    String json = "{\"device_id\":\"esp32-01\",\"raw_tds\":";
+    json += String(raw_tds);
+    json += ",\"raw_distance\":";
+    json += String(raw_distance);
+    json += "}";
 
-  int httpResponseCode = http.POST(requestBody);
+    Serial.print("Sending JSON: ");
+    Serial.println(json);
 
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.print("✅ HTTP Code: ");
+    int httpResponseCode = http.POST(json); // Send POST request
+
+    Serial.print("HTTP Response code: ");
     Serial.println(httpResponseCode);
-    Serial.print("📨 Response: ");
-    Serial.println(response);
+
+    String payload = http.getString();      // Get server response
+    Serial.println("Server response:");
+    Serial.println(payload);
+
+    // If response is not "No significant event...", briefly turn on the red LED
+    if (payload.indexOf("No significant event, no POST sent.") == -1) {
+      digitalWrite(LED_ROJO_PIN, HIGH);
+      delay(300); 
+      digitalWrite(LED_ROJO_PIN, LOW); 
+    }
+
+    http.end();                            // End HTTP connection
   } else {
-    Serial.print("❌ Request error: ");
-    Serial.println(httpResponseCode);
+    Serial.println("WiFi not connected!");
   }
-
-  http.end();
 }
